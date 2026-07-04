@@ -1,0 +1,28 @@
+{
+  "id": "auto-generated",
+  "title": "Short, specific finding title",
+  "severity": "info | low | medium | high | critical",
+  "confidence": "confirmed | suspected | false_positive",
+  "type": "IDOR | BOLA | XSS | SQLi | SSRF | BrokenAuth | OpenRedirect | InfoLeak | ...",
+  "cwe": "CWE-639",
+  "owasp": "A01:2021-Broken Access Control",
+  "cvss": "8.1 / CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  "target": "https://www.digikala.com",
+  "endpoint": "https://api.digikala.com/v1/super-app/pillars/",
+  "parameter": "global_user_id",
+  "description": "What the vulnerability is and where it occurs.",
+  "impact": "What an attacker gains (e.g. read another user's data).",
+  "steps_to_reproduce": [
+    "1. Authenticate as Account A and capture GET /v1/.../?global_user_id=<A>.",
+    "2. Replay the request with Account B's session, keeping A's id.",
+    "3. Observe A's data returned to B."
+  ],
+  "request": "GET /v1/super-app/pillars/?global_user_id=<A>&pillar=digikala HTTP/1.1\nHost: api.digikala.com\nCookie: <B's session>",
+  "response": "HTTP/1.1 200 OK ... <A's private data>",
+  "evidence": "Why this response proves cross-account access.",
+  "remediation": "Enforce object-level authorization: verify the requested id belongs to the authenticated user.",
+  "references": [
+    "https://owasp.org/Top10/A01_2021-Broken_Access_Control/",
+    "https://cwe.mitre.org/data/definitions/639.html"
+  ]
+}
