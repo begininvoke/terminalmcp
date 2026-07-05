@@ -16,10 +16,11 @@ export function PromptEntry({
   onStart,
   starting,
 }: {
-  onStart: (name: string, prompt: string, goal: string, cookie: string, squad: string[]) => void;
+  onStart: (name: string, prompt: string, goal: string, cookie: string, squad: string[], target: string) => void;
   starting: boolean;
 }) {
   const [name, setName] = useState("");
+  const [target, setTarget] = useState("");
   const [goal, setGoal] = useState("");
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [cookie, setCookie] = useState("");
@@ -40,6 +41,17 @@ export function PromptEntry({
           </p>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-foreground">Target URL <span className="text-red-400">*</span></label>
+            <Input
+              placeholder="https://www.digikalajet.com/"
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              className="font-mono"
+            />
+            <p className="text-xs text-muted-foreground">The exact in-scope target. The agent uses this host in every command — no placeholders.</p>
+          </div>
+
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-muted-foreground">Engagement name (optional)</label>
@@ -91,7 +103,7 @@ export function PromptEntry({
           </label>
 
           <div className="flex justify-end">
-            <Button onClick={() => onStart(name, prompt, goal, cookie, squad ? SQUAD_CLASSES : [])} disabled={starting || !prompt.trim()}>
+            <Button onClick={() => onStart(name, prompt, goal, cookie, squad ? SQUAD_CLASSES : [], target)} disabled={starting || !prompt.trim() || !target.trim()}>
               {starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Terminal className="h-4 w-4" />}
               Start engagement
             </Button>

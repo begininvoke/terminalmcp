@@ -137,10 +137,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function handleStart(name: string, prompt: string, goal?: string, cookie?: string, squad?: string[]) {
+  async function handleStart(name: string, prompt: string, goal?: string, cookie?: string, squad?: string[], target?: string) {
     setStarting(true);
     try {
-      connect(await createEngagement(name, prompt, { goal, cookie, squad }));
+      connect(await createEngagement(name, prompt, { goal, cookie, squad, target }));
       setView("engagement");
     } catch {
       alert("Failed to start engagement. Is the backend running on :8080?");

@@ -7,7 +7,8 @@ type Engagement struct {
 	ID          string         `json:"id"`
 	Name        string         `json:"name"`
 	FirstPrompt string         `json:"first_prompt"`
-	Goal        string         `json:"goal,omitempty"`  // focused objective, e.g. "find IDOR" — drives exhaustive, goal-oriented testing
+	Target      string         `json:"target,omitempty"` // the exact target URL/host — injected so the agent never uses placeholders
+	Goal        string         `json:"goal,omitempty"`   // focused objective, e.g. "find IDOR" — drives exhaustive, goal-oriented testing
 	Squad       []string       `json:"squad,omitempty"` // if set, run one parallel sub-agent per vuln class (multi-agent mode)
 	Cookie      string         `json:"-"`              // session cookie for authenticated discovery (in-memory only, never persisted/returned)
 	Status      string         `json:"status"` // created|running|awaiting_input|done|error|stopped

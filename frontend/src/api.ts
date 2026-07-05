@@ -3,11 +3,11 @@ import type { Engagement } from "./types";
 const API_BASE = "http://localhost:8080";
 const WS_BASE = "ws://localhost:8080";
 
-export async function createEngagement(name: string, firstPrompt: string, opts?: { cookie?: string; goal?: string; squad?: string[] }): Promise<Engagement> {
+export async function createEngagement(name: string, firstPrompt: string, opts?: { cookie?: string; goal?: string; squad?: string[]; target?: string }): Promise<Engagement> {
   const res = await fetch(`${API_BASE}/api/engagements`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, first_prompt: firstPrompt, cookie: opts?.cookie || "", goal: opts?.goal || "", squad: opts?.squad || [] }),
+    body: JSON.stringify({ name, first_prompt: firstPrompt, target: opts?.target || "", cookie: opts?.cookie || "", goal: opts?.goal || "", squad: opts?.squad || [] }),
   });
   if (!res.ok) throw new Error(`create failed: ${res.status}`);
   return res.json();

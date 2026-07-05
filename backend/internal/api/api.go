@@ -199,6 +199,7 @@ func (s *Server) handleEngagements(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Name        string   `json:"name"`
 			FirstPrompt string   `json:"first_prompt"`
+			Target      string   `json:"target"`
 			Goal        string   `json:"goal"`
 			Cookie      string   `json:"cookie"`
 			Squad       []string `json:"squad"`
@@ -218,6 +219,7 @@ func (s *Server) handleEngagements(w http.ResponseWriter, r *http.Request) {
 			ID:          fmt.Sprintf("e%d", time.Now().UnixNano()),
 			Name:        body.Name,
 			FirstPrompt: body.FirstPrompt,
+			Target:      body.Target,
 			Goal:        body.Goal,
 			Cookie:      body.Cookie,
 			Squad:       body.Squad,

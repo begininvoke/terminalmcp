@@ -57,7 +57,10 @@ type Config struct {
 		ChromePath string `yaml:"chrome_path"` // empty = auto-detect
 		Headless   bool   `yaml:"headless"`
 		NavWaitS   int    `yaml:"nav_wait_s"` // seconds to let the page load/XHRs fire
-		TimeoutS   int    `yaml:"timeout_s"`
+		TimeoutS    int    `yaml:"timeout_s"`
+		RemoteURL   string `yaml:"remote_url"`    // e.g. http://localhost:9222 — attach to a real Chrome via its debug port
+		AutoLaunch  bool   `yaml:"auto_launch"`   // auto-start a persistent debug Chrome if remote_url isn't up
+		UserDataDir string `yaml:"user_data_dir"` // profile dir for that Chrome (log into the target there once; reused)
 	} `yaml:"browser"`
 
 	Storage struct {

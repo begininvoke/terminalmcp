@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -39,6 +40,7 @@ type Agent struct {
 
 	autonomous map[string]bool // engagementID -> skip operator intake (squad mode)
 	memoryMu   sync.Mutex      // guards the global memory.md file
+	llmSem     chan struct{}   // caps concurrent LLM calls (protects the gateway under squad mode)
 }
 
 func New(cfg *config.Config, st *store.Store, hub *events.Hub, exec *terminal.Executor) *Agent {
@@ -51,6 +53,7 @@ func New(cfg *config.Config, st *store.Store, hub *events.Hub, exec *terminal.Ex
 		cancels:    make(map[string]context.CancelFunc),
 		cmdSeen:    make(map[string]int),
 		autonomous: make(map[string]bool),
+		llmSem:     make(chan struct{}, 2), // at most 2 concurrent LLM calls
 	}
 }
 
@@ -197,6 +200,51 @@ func (a *Agent) notesSection(id string) string {
 		notes = "...(earlier journal trimmed)...\n" + notes[len(notes)-4000:]
 	}
 	return "\n\n=== YOUR WORKING JOURNAL (review before acting; do NOT repeat FAILED methods — invent a new one) ===\n" + notes
+}
+
+var placeholderHosts = []string{
+	"target-url.com", "target.example.com", "www.target-url.com", "your-target.com",
+	"yourdomain.com", "your-domain.com", "target.com", "example.com", "www.example.com",
+	"example.org", "test.com", "victim.com", "target_url", "TARGET_URL",
+}
+
+// targetHint injects the exact target so the agent never invents placeholders.
+func (a *Agent) targetHint(id string) string {
+	eng, err := a.st.Get(id)
+	if err != nil || eng.Target == "" {
+		return ""
+	}
+	return "\n\n=== PRIMARY TARGET ===\nThe ONLY in-scope target is: " + eng.Target + "\n" +
+		"Use this EXACT host/URL in every command, browser_capture, and tool call. " +
+		"NEVER use placeholder domains like target-url.com, example.com, or target.example.com — those are wrong. " +
+		"If you need the host, it is: " + targetHost(eng.Target) + "."
+}
+
+func targetHost(raw string) string {
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return raw
+}
+
+// fixTarget rewrites placeholder hosts in a command/URL to the real target host.
+func (a *Agent) fixTarget(id, s string) (string, bool) {
+	eng, err := a.st.Get(id)
+	if err != nil || eng.Target == "" {
+		return s, false
+	}
+	host := targetHost(eng.Target)
+	if host == "" {
+		return s, false
+	}
+	out, changed := s, false
+	for _, p := range placeholderHosts {
+		if strings.Contains(out, p) {
+			out = strings.ReplaceAll(out, p, host)
+			changed = true
+		}
+	}
+	return out, changed
 }
 
 // wordlistHint lists the installed wordlists with absolute paths so the model
@@ -364,9 +412,9 @@ func (a *Agent) runAgentLoop(ctx context.Context, id string, provider llm.Provid
 	maxNudges := 3
 	// A focused goal makes the agent exhaustive: keep going (bounded by the time
 	// budget) instead of stopping after a few nudges.
-	baseSys := systemPrompt + a.wordlistHint() + a.skillHint() + a.globalMemorySection()
+	baseSys := systemPrompt + a.targetHint(id) + a.wordlistHint() + a.skillHint() + a.globalMemorySection()
 	if goal != "" {
-		baseSys += goalDirective(goal)
+		baseSys += goalDirective(goal) + a.autoSkill(goal)
 		maxNudges = 1 << 30 // effectively unlimited; the time budget governs
 	}
 
@@ -385,7 +433,9 @@ func (a *Agent) runAgentLoop(ctx context.Context, id string, provider llm.Provid
 		trimOldToolResults(messages, 8)
 		// Re-inject the working journal each turn so the agent always "checks the md".
 		sys := baseSys + a.notesSection(id)
+		a.llmSem <- struct{}{} // cap concurrent gateway calls (squad-safe)
 		resp, err := provider.Create(ctx, sys, messages, tools)
+		<-a.llmSem
 		a.logLLM(id, sys, messages, resp, err)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -778,14 +828,75 @@ func (a *Agent) pickWordlist(cmd string) string {
 	return ""
 }
 
+// cookieFlagRe detects a cookie already supplied on the command line (curl -b,
+// --cookie), so we don't double up when injecting the session cookie.
+var cookieFlagRe = regexp.MustCompile(`(^|\s)(-b|--cookie)(\s|=)`)
+
+// injectSessionCookie appends the engagement's session cookie to curl/ffuf/wget
+// commands that hit the in-scope target, so terminal scans run authenticated with
+// the same login browser_capture discovered. It is a no-op when there is no
+// cookie, the command doesn't reference the target host, or a cookie is already
+// present. Returns the rewritten command and a human note (empty if unchanged).
+func (a *Agent) injectSessionCookie(id, command string) (string, string) {
+	eng, err := a.st.Get(id)
+	if err != nil || strings.TrimSpace(eng.Cookie) == "" {
+		return command, ""
+	}
+	host := targetHost(eng.Target)
+	if host == "" || !strings.Contains(command, host) {
+		return command, "" // only ever attach the session to the in-scope target
+	}
+	if strings.Contains(strings.ToLower(command), "cookie:") || cookieFlagRe.MatchString(command) {
+		return command, "" // command already carries a cookie — respect it
+	}
+	cookie := strings.ReplaceAll(eng.Cookie, `'`, `'\''`) // safe inside single quotes
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return command, ""
+	}
+	switch strings.ToLower(fields[0]) {
+	case "curl":
+		return command + " -b '" + cookie + "'", "attached session cookie (-b) so curl runs authenticated"
+	case "ffuf":
+		return command + " -H 'Cookie: " + cookie + "'", "attached session cookie header so ffuf runs authenticated"
+	case "wget":
+		return command + " --header='Cookie: " + cookie + "'", "attached session cookie so wget runs authenticated"
+	}
+	return command, ""
+}
+
+// redactCookie masks the session cookie value in a string before it is emitted to
+// the UI / persisted event log, keeping the secret out of stored data.
+func (a *Agent) redactCookie(id, s string) string {
+	eng, err := a.st.Get(id)
+	if err != nil || strings.TrimSpace(eng.Cookie) == "" {
+		return s
+	}
+	out := strings.ReplaceAll(s, eng.Cookie, "<session-cookie>")
+	escaped := strings.ReplaceAll(eng.Cookie, `'`, `'\''`)
+	return strings.ReplaceAll(out, escaped, "<session-cookie>")
+}
+
 // runCommand executes through the terminal layer with live streaming.
 func (a *Agent) runCommand(ctx context.Context, id, command string, timeoutS int) string {
+	// Replace placeholder hosts (target-url.com, example.com, …) with the real target.
+	if fixed, changed := a.fixTarget(id, command); changed {
+		command = fixed
+		a.emit(id, model.Event{Type: model.EvAgentMessage, Data: map[string]string{"text": "↳ rewrote placeholder host to the real target"}})
+	}
 	// Auto-repair common mistakes before running: quote bare URLs (so '&' isn't
 	// treated as a bash background operator) and swap non-existent wordlist paths
 	// for a real one. Saves the agent from looping on broken commands.
 	if fixed, note := a.sanitizeCommand(command); note != "" {
 		command = fixed
 		a.emit(id, model.Event{Type: model.EvAgentMessage, Data: map[string]string{"text": "auto-fixed command — " + note}})
+	}
+
+	// Attach the engagement's session cookie to curl/ffuf/wget hitting the target,
+	// so terminal scans run authenticated (same login browser_capture discovered).
+	if fixed, note := a.injectSessionCookie(id, command); note != "" {
+		command = fixed
+		a.emit(id, model.Event{Type: model.EvAgentMessage, Data: map[string]string{"text": note}})
 	}
 
 	// Guard against the model looping on the same (often failing) command.
@@ -804,7 +915,7 @@ func (a *Agent) runCommand(ctx context.Context, id, command string, timeoutS int
 
 	a.rateLimitWait(ctx, id)
 	cid := fmt.Sprintf("c%d", time.Now().UnixNano())
-	a.emit(id, model.Event{Type: model.EvCommandStarted, Data: map[string]string{"cid": cid, "cmdline": command}})
+	a.emit(id, model.Event{Type: model.EvCommandStarted, Data: map[string]string{"cid": cid, "cmdline": a.redactCookie(id, command)}})
 
 	timeout := time.Duration(a.cfg.Agent.CommandTimeoutS) * time.Second
 	if timeoutS > 0 {
@@ -836,6 +947,9 @@ func (a *Agent) runBrowserCapture(ctx context.Context, id, target, cookie string
 			cookie = eng.Cookie
 		}
 	}
+	if fixed, changed := a.fixTarget(id, target); changed { // never capture a placeholder host
+		target = fixed
+	}
 	cid := fmt.Sprintf("c%d", time.Now().UnixNano())
 	a.emit(id, model.Event{Type: model.EvCommandStarted, Data: map[string]string{"cid": cid, "cmdline": "browser ▶ open " + target}})
 
@@ -846,8 +960,11 @@ func (a *Agent) runBrowserCapture(ctx context.Context, id, target, cookie string
 	res, err := browser.Capture(ctx, browser.Config{
 		ChromePath: a.cfg.Browser.ChromePath,
 		Headless:   a.cfg.Browser.Headless,
-		NavWait:    nav,
-		Timeout:    time.Duration(a.cfg.Browser.TimeoutS) * time.Second,
+		NavWait:     nav,
+		Timeout:     time.Duration(a.cfg.Browser.TimeoutS) * time.Second,
+		RemoteURL:   a.cfg.Browser.RemoteURL,
+		AutoLaunch:  a.cfg.Browser.AutoLaunch,
+		UserDataDir: a.cfg.Browser.UserDataDir,
 	}, target, cookie, nil)
 	if err != nil {
 		a.emit(id, model.Event{Type: model.EvOutputChunk, Data: map[string]string{"cid": cid, "stream": "stderr", "data": err.Error()}})
@@ -878,6 +995,15 @@ func (a *Agent) runBrowserCapture(ctx context.Context, id, target, cookie string
 			}
 		}
 	})
+
+	// Adopt the browser's live session cookies so terminal scanners (curl/ffuf)
+	// and idor_scan run authenticated with the same login the operator has in Chrome.
+	if res.Cookies != "" {
+		_ = a.st.Update(id, func(e *model.Engagement) { e.Cookie = res.Cookies })
+		a.emit(id, model.Event{Type: model.EvAgentMessage, Data: map[string]string{
+			"text": fmt.Sprintf("🔑 captured %d session cookie(s) from the browser — curl/ffuf/idor_scan will reuse this login", strings.Count(res.Cookies, "=")),
+		}})
+	}
 
 	a.emit(id, model.Event{Type: model.EvOutputChunk, Data: map[string]string{"cid": cid, "stream": "stdout",
 		"data": fmt.Sprintf("captured %d requests · %d same-origin endpoints · %d links", res.Total, len(res.Endpoints), len(res.Links))}})

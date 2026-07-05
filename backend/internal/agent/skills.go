@@ -86,6 +86,82 @@ func (a *Agent) loadSkillBody(name string) (string, error) {
 	return string(b), nil
 }
 
+// autoSkill picks the most relevant skill for a goal and injects its full
+// playbook into the agent's context — so the agent always has an expert method
+// to follow without having to remember to call search_skills.
+func (a *Agent) autoSkill(goal string) string {
+	if goal == "" || len(a.skillIndex()) == 0 {
+		return ""
+	}
+	g := strings.ToLower(goal)
+	q := g
+	switch {
+	case strings.Contains(g, "idor"), strings.Contains(g, "bola"):
+		q = "idor"
+	case strings.Contains(g, "xss"), strings.Contains(g, "cross-site"), strings.Contains(g, "cross site"):
+		q = "xss"
+	case strings.Contains(g, "sql"):
+		q = "sql injection"
+	case strings.Contains(g, "ssrf"):
+		q = "ssrf"
+	case strings.Contains(g, "access"):
+		q = "access control"
+	case strings.Contains(g, "auth"):
+		q = "authentication"
+	}
+	cands := a.searchSkills(q, 40)
+	if len(cands) == 0 {
+		if f := strings.Fields(q); len(f) > 0 {
+			cands = a.searchSkills(f[0], 40)
+		}
+	}
+	if len(cands) == 0 {
+		return ""
+	}
+	best := bestSkill(cands, strings.Fields(q))
+	body, err := a.loadSkillBody(best)
+	if err != nil {
+		return ""
+	}
+	if len(body) > 3500 {
+		body = body[:3500] + "\n...[truncated — call load_skill(\"" + best + "\") for the full playbook]"
+	}
+	return "\n\n=== EXPERT PLAYBOOK: " + best + " (FOLLOW THIS to reach the goal; search_skills for more) ===\n" + body
+}
+
+// bestSkill ranks candidates: keyword-in-name and offensive verbs score high,
+// defensive/analysis skills score low — so we pick an exploitation playbook.
+func bestSkill(cands []SkillMeta, qwords []string) string {
+	offensive := []string{"exploiting-", "testing-", "performing-", "attacking-", "abusing-", "bypassing-", "finding-", "identifying-", "fuzzing-"}
+	defensive := []string{"analyzing-", "detecting-", "auditing-", "monitoring-", "investigating-", "responding-", "hardening-", "reviewing-", "hunting-", "triaging-"}
+	best, bestScore := cands[0].Name, -1<<30
+	for _, s := range cands {
+		name := strings.ToLower(s.Name)
+		score := 0
+		for _, w := range qwords {
+			if strings.Contains(name, w) {
+				score += 10
+			}
+		}
+		for _, p := range offensive {
+			if strings.HasPrefix(name, p) {
+				score += 6
+				break
+			}
+		}
+		for _, p := range defensive {
+			if strings.HasPrefix(name, p) {
+				score -= 6
+				break
+			}
+		}
+		if score > bestScore {
+			bestScore, best = score, s.Name
+		}
+	}
+	return best
+}
+
 // skillHint tells the agent that expert playbooks exist and how to use them.
 func (a *Agent) skillHint() string {
 	n := len(a.skillIndex())

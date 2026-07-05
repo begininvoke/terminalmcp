@@ -6,8 +6,13 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -31,14 +36,78 @@ type Result struct {
 	Endpoints []string  `json:"endpoints"` // deduped same-origin API/doc/script URLs
 	Links     []string  `json:"links"`     // same-origin anchor hrefs
 	Total     int       `json:"total"`
+	Cookies   string    `json:"-"` // "k=v; k2=v2" Cookie header for the target, read from the live browser session (never persisted)
 }
 
 // Config controls how Chrome is launched.
 type Config struct {
-	ChromePath string
-	Headless   bool
-	NavWait    time.Duration
-	Timeout    time.Duration
+	ChromePath  string
+	Headless    bool
+	NavWait     time.Duration
+	Timeout     time.Duration
+	RemoteURL   string // if set (e.g. http://localhost:9222), attach to a real Chrome instead of launching headless
+	AutoLaunch  bool   // if RemoteURL is unreachable, start a persistent debug Chrome and attach to it
+	UserDataDir string // profile dir for the auto-launched debug Chrome (persists logins across runs)
+}
+
+// ensureDebugChrome makes sure a Chrome with the debug port is running; if not,
+// it launches a persistent one (own profile) so it survives across captures.
+func ensureDebugChrome(remoteURL, chromePath, userDataDir string) error {
+	if _, err := remoteWSURL(remoteURL); err == nil {
+		return nil // already up
+	}
+	path := detectChrome(chromePath)
+	if path == "" {
+		return fmt.Errorf("no Chrome/Chromium binary found to launch")
+	}
+	port := "9222"
+	if u, err := url.Parse(remoteURL); err == nil && u.Port() != "" {
+		port = u.Port()
+	}
+	if userDataDir == "" {
+		userDataDir = filepath.Join(os.TempDir(), "pentest-chrome")
+	}
+	cmd := exec.Command(path,
+		"--remote-debugging-port="+port,
+		"--remote-allow-origins=*", // required by Chrome 111+ for CDP websocket connections
+		"--user-data-dir="+userDataDir,
+		"--no-first-run", "--no-default-browser-check",
+		"about:blank",
+	)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("launch debug Chrome: %w", err)
+	}
+	go cmd.Wait() // reap when it eventually exits; do not block
+	for i := 0; i < 24; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if _, err := remoteWSURL(remoteURL); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("debug Chrome did not expose %s in time", remoteURL)
+}
+
+// remoteWSURL resolves a CDP websocket endpoint from an http debug URL.
+func remoteWSURL(httpURL string) (string, error) {
+	u := strings.TrimRight(httpURL, "/")
+	if strings.HasPrefix(u, "ws://") || strings.HasPrefix(u, "wss://") {
+		return u, nil
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(u + "/json/version")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var v struct {
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return "", err
+	}
+	if v.WebSocketDebuggerURL == "" {
+		return "", fmt.Errorf("no webSocketDebuggerUrl at %s", u)
+	}
+	return v.WebSocketDebuggerURL, nil
 }
 
 // detectChrome finds a Chrome/Chromium binary if none was configured.
@@ -74,33 +143,6 @@ func Capture(parent context.Context, cfg Config, target, cookieHeader string, ex
 		timeout = 60 * time.Second
 	}
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", cfg.Headless),
-		chromedp.Flag("ignore-certificate-errors", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true),
-	)
-	if path := detectChrome(cfg.ChromePath); path != "" {
-		opts = append(opts, chromedp.ExecPath(path))
-	}
-
-	allocCtx, cancelAlloc := chromedp.NewExecAllocator(parent, opts...)
-	defer cancelAlloc()
-	ctx, cancelCtx := chromedp.NewContext(allocCtx)
-	defer cancelCtx()
-	ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
-	defer cancelTimeout()
-
-	var mu sync.Mutex
-	var reqs []Request
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-		if e, ok := ev.(*network.EventRequestWillBeSent); ok {
-			mu.Lock()
-			reqs = append(reqs, Request{Method: e.Request.Method, URL: e.Request.URL, Type: e.Type.String()})
-			mu.Unlock()
-		}
-	})
-
 	headers := map[string]interface{}{}
 	for k, v := range extraHeaders {
 		headers[k] = v
@@ -109,41 +151,107 @@ func Capture(parent context.Context, cfg Config, target, cookieHeader string, ex
 		headers["Cookie"] = cookieHeader
 	}
 
-	// Navigate.
-	pre := []chromedp.Action{network.Enable()}
-	if len(headers) > 0 {
-		pre = append(pre, network.SetExtraHTTPHeaders(network.Headers(headers)))
-	}
-	pre = append(pre, chromedp.Navigate(target))
-	if err := chromedp.Run(ctx, pre...); err != nil && len(reqs) == 0 {
-		return nil, err
+	// One capture attempt against a given allocator. Returns an error if the page
+	// never loaded (e.g. the -32000 "no browser open" when remote attach is stale).
+	attempt := func(allocCtx context.Context, cancelAlloc context.CancelFunc) (*Result, error) {
+		defer cancelAlloc()
+		ctx, cancelCtx := chromedp.NewContext(allocCtx)
+		defer cancelCtx()
+		ctx, cancelTimeout := context.WithTimeout(ctx, timeout)
+		defer cancelTimeout()
+
+		var mu sync.Mutex
+		var reqs []Request
+		chromedp.ListenTarget(ctx, func(ev interface{}) {
+			if e, ok := ev.(*network.EventRequestWillBeSent); ok {
+				mu.Lock()
+				reqs = append(reqs, Request{Method: e.Request.Method, URL: e.Request.URL, Type: e.Type.String()})
+				mu.Unlock()
+			}
+		})
+
+		pre := []chromedp.Action{network.Enable()}
+		if len(headers) > 0 {
+			pre = append(pre, network.SetExtraHTTPHeaders(network.Headers(headers)))
+		}
+		pre = append(pre, chromedp.Navigate(target))
+		if err := chromedp.Run(ctx, pre...); err != nil {
+			mu.Lock()
+			n := len(reqs)
+			mu.Unlock()
+			if n == 0 {
+				return nil, err // nothing captured -> real failure, let caller fall back
+			}
+		}
+
+		start := time.Now()
+		for time.Since(start) < navWait {
+			var dummy int
+			_ = chromedp.Run(ctx, chromedp.Evaluate(`window.scrollBy(0, Math.max(600, window.innerHeight)); 0`, &dummy))
+			select {
+			case <-ctx.Done():
+				start = start.Add(-navWait)
+			case <-time.After(600 * time.Millisecond):
+			}
+		}
+		var links []string
+		_ = chromedp.Run(ctx,
+			chromedp.Evaluate(`window.scrollTo(0,0); 0`, new(int)),
+			chromedp.Evaluate(`Array.from(document.querySelectorAll('a[href]')).map(a=>a.href)`, &links),
+		)
+		// Read the live session cookies for the target so terminal scanners
+		// (curl/ffuf) can reuse the same authenticated session the browser has.
+		var cookieHdr string
+		_ = chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+			cs, err := network.GetCookies().WithURLs([]string{target}).Do(ctx)
+			if err != nil {
+				return err
+			}
+			var parts []string
+			seen := map[string]bool{}
+			for _, ck := range cs {
+				if ck.Name == "" || seen[ck.Name] {
+					continue
+				}
+				seen[ck.Name] = true
+				parts = append(parts, ck.Name+"="+ck.Value)
+			}
+			cookieHdr = strings.Join(parts, "; ")
+			return nil
+		}))
+		mu.Lock()
+		captured := reqs
+		mu.Unlock()
+		res := buildResult(target, captured, links)
+		res.Cookies = cookieHdr
+		return res, nil
 	}
 
-	// Settle: scroll through the page for the full navWait window to trigger
-	// lazy-loaded content/XHRs and give the DOM time to render. (Scrolling the
-	// whole window catches far more endpoints+links than a single fixed sleep.)
-	start := time.Now()
-	for time.Since(start) < navWait {
-		var dummy int
-		_ = chromedp.Run(ctx, chromedp.Evaluate(`window.scrollBy(0, Math.max(600, window.innerHeight)); 0`, &dummy))
-		select {
-		case <-ctx.Done():
-			start = start.Add(-navWait) // force exit
-		case <-time.After(600 * time.Millisecond):
+	// Prefer attaching to a real Chrome via its debug port; if that fails (e.g.
+	// -32000), fall back to a headless instance so capture never dead-ends.
+	if cfg.RemoteURL != "" {
+		if cfg.AutoLaunch {
+			_ = ensureDebugChrome(cfg.RemoteURL, cfg.ChromePath, cfg.UserDataDir)
+		}
+		if ws, err := remoteWSURL(cfg.RemoteURL); err == nil {
+			a, c := chromedp.NewRemoteAllocator(parent, ws)
+			if res, err := attempt(a, c); err == nil {
+				return res, nil
+			}
+			// else: remote attach failed — fall through to headless
 		}
 	}
-
-	// Extract anchors after settle, from the top (best effort — must not drop endpoints).
-	var links []string
-	_ = chromedp.Run(ctx,
-		chromedp.Evaluate(`window.scrollTo(0,0); 0`, new(int)),
-		chromedp.Evaluate(`Array.from(document.querySelectorAll('a[href]')).map(a=>a.href)`, &links),
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("ignore-certificate-errors", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
 	)
-
-	mu.Lock()
-	captured := reqs
-	mu.Unlock()
-	return buildResult(target, captured, links), nil
+	if path := detectChrome(cfg.ChromePath); path != "" {
+		opts = append(opts, chromedp.ExecPath(path))
+	}
+	a, c := chromedp.NewExecAllocator(parent, opts...)
+	return attempt(a, c)
 }
 
 // registrableDomain returns the last two labels of a host (e.g. api.digikala.com
